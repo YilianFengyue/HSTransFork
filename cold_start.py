@@ -6,31 +6,85 @@ import scipy.io as sio
 import torch
 from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score, average_precision_score
-from Net import Trans, drug2emb_encoder  # <--- 【修复】从 Net.py 导入
-from smiles2vector import load_drug_smile
+from Net import Trans, drug2emb_encoder
 from utils import rmse, MAE, pearson, spearman
 from tqdm import tqdm
 import os
+import random
 
 # --- 1. 配置路径 ---
-SMILES_FILE_759 = 'data/drug_SMILES_759.csv'
-FREQ_FILE_759 = 'data/frequency_750+9.mat'
+SMILES_FILE = 'data/drug_SMILES_750.csv'
+FREQ_FILE = 'data/raw_frequency_750.mat'
 
 # --- 2. 辅助函数 ---
-
 def loss_fun(output, label):
     loss = torch.sum((output - label) ** 2)
     return loss
 
-# 究极优化版 Identify Sub (只针对训练集跑)
-def identify_sub_optimized(train_data, suffix='cold_start'):
+# === 【新增】采样函数 (复刻 main.py 逻辑) ===
+def get_balanced_train_data(drug_indices, freq_matrix, all_smiles):
+    """
+    只针对训练集进行 1:1 正负样本采样
+    """
+    print(f">> Performing Balanced Sampling (1:1) on {len(drug_indices)} training drugs...")
+    data_list = []
+    
+    pos_samples = []
+    neg_samples = []
+    
+    # 1. 遍历训练集的药，收集所有正样本和负样本坐标
+    # 为了加速，直接利用 numpy 索引
+    # matrix subset:
+    sub_matrix = freq_matrix[drug_indices, :]
+    
+    # 找到所有非0元素 (Pos)
+    rows, cols = np.nonzero(sub_matrix)
+    for r, c in zip(rows, cols):
+        real_drug_idx = drug_indices[r]
+        label = sub_matrix[r, c]
+        pos_samples.append([c, all_smiles[real_drug_idx], label])
+        
+    # 找到所有0元素 (Neg)
+    rows_neg, cols_neg = np.where(sub_matrix == 0)
+    # 因为负样本太多，我们先存索引，稍后随机采
+    neg_indices = list(range(len(rows_neg)))
+    
+    # 2. 随机采样负样本，数量等于正样本
+    n_pos = len(pos_samples)
+    if len(neg_indices) > n_pos:
+        selected_neg_indices = random.sample(neg_indices, n_pos)
+    else:
+        selected_neg_indices = neg_indices # 负样本不够（不太可能）全取
+        
+    for idx in selected_neg_indices:
+        r = rows_neg[idx]
+        c = cols_neg[idx]
+        real_drug_idx = drug_indices[r]
+        neg_samples.append([c, all_smiles[real_drug_idx], 0.0]) # Label 0
+        
+    # 3. 合并并打乱
+    final_data = pos_samples + neg_samples
+    random.shuffle(final_data)
+    
+    print(f"   Positives: {len(pos_samples)}, Negatives: {len(neg_samples)}")
+    print(f"   Total Balanced Training Samples: {len(final_data)}")
+    
+    # 转为 DataFrame
+    return pd.DataFrame(final_data, columns=['SE_id', 'Drug_smile', 'Label'])
+
+# --- 3. 核心功能函数 ---
+
+def identify_sub_optimized(train_df, suffix='cold_start'):
+    """
+    基于 DataFrame 提取子结构
+    """
     print(f'\n[Step 1] 正在基于训练集提取有效子结构 (Suffix: {suffix})...')
     
-    drug_smile = [item[1] for item in train_data]
-    side_id = [item[0] for item in train_data]
-    labels = [item[2] for item in train_data]
+    drug_smile = train_df['Drug_smile'].tolist()
+    side_id = train_df['SE_id'].tolist()
+    labels = train_df['Label'].tolist()
 
-    # 1. 药物去重编码 (加速 1000倍)
+    # 1. 药物去重编码
     print(">> [优化] 正在对药物子结构进行去重编码...")
     unique_smiles = list(set(drug_smile))
     smile_cache = {}
@@ -38,22 +92,25 @@ def identify_sub_optimized(train_data, suffix='cold_start'):
         drug_sub, mask = drug2emb_encoder(smile)
         smile_cache[smile] = drug_sub.tolist()
 
-    sub_dict = {}
-    for i in range(len(drug_smile)):
-        sub_dict[i] = smile_cache[drug_smile[i]]
+    sub_dict_list = [] # 对应 drug_smile 的顺序
+    for s in drug_smile:
+        sub_dict_list.append(smile_cache[s])
 
     # 2. 构建矩阵
     print(">> [优化] 正在构建副作用关联矩阵...")
     SE_sub = np.zeros((994, 2686))
+    
+    # 直接迭代加速
     for j in tqdm(range(len(drug_smile)), desc="Building Matrix"):
-        sideID = side_id[j]
         label = float(labels[j])
         if label > 0:
-            for sub_k in sub_dict[j]:
+            sideID = side_id[j]
+            subs = sub_dict_list[j]
+            for sub_k in subs:
                 if sub_k == 0: continue
                 SE_sub[int(sideID)][int(sub_k)] += label
 
-    # 3. 计算频率 (Numpy加速)
+    # 3. 计算频率
     n = np.sum(SE_sub)
     SE_sum = np.sum(SE_sub, axis=1)
     SE_p = SE_sum / n
@@ -86,7 +143,6 @@ def identify_sub_optimized(train_data, suffix='cold_start'):
                 k_idx += 1
             else: break
 
-    # 保存文件
     if not os.path.exists('data/sub'): os.makedirs('data/sub')
     np.save(f"data/sub/SE_sub_index_50_{suffix}.npy", SE_sub_index)
     SE_sub_mask = SE_sub_index.copy()
@@ -94,22 +150,19 @@ def identify_sub_optimized(train_data, suffix='cold_start'):
     np.save(f"data/sub/SE_sub_mask_50_{suffix}.npy", SE_sub_mask)
     print("[Step 1] 提取完成！\n")
 
-# 究极优化版 Dataset (内存全缓存 = 极速)
 class Data_Encoder(torch.utils.data.Dataset):
     def __init__(self, df, suffix='cold_start'):
         self.df = df
         self.suffix = suffix 
         
         print(f"Loading Dataset ({len(df)} samples)...")
-        # 1. 药物缓存 (内存)
         print("  1. Pre-encoding drugs to RAM...")
         self.drug_cache = {}
         unique_drugs = self.df['Drug_smile'].unique()
         for d in unique_drugs:
             self.drug_cache[d] = drug2emb_encoder(d)
             
-        # 2. 副作用缓存 (内存) - 你的新要求
-        print(f"  2. Pre-loading Side Effect Matrices to RAM...")
+        print(f"  2. Pre-loading Side Effect Matrices (Suffix: {suffix})...")
         self.SE_index_all = np.load(f"data/sub/SE_sub_index_50_{suffix}.npy").astype(int)
         self.SE_mask_all = np.load(f"data/sub/SE_sub_mask_50_{suffix}.npy")
         print("Dataset Ready!")
@@ -123,14 +176,12 @@ class Data_Encoder(torch.utils.data.Dataset):
         s = int(row['SE_id'])
         label = row['Label']
 
-        # 全程查表，无硬盘IO
         d_v, input_mask_d = self.drug_cache[d]
         s_v = self.SE_index_all[s, :]
         input_mask_s = self.SE_mask_all[s, :]
         
         return d_v, s_v, input_mask_d, input_mask_s, label
 
-# 训练函数 (极速版)
 def trainfun(model, device, train_loader, optimizer, epoch):
     model.train()
     avg_loss = []
@@ -154,7 +205,6 @@ def trainfun(model, device, train_loader, optimizer, epoch):
 
     return sum(avg_loss) / len(avg_loss)
 
-# 预测函数
 def predict(model, device, test_loader):
     total_preds = torch.Tensor()
     total_labels = torch.Tensor()
@@ -169,7 +219,6 @@ def predict(model, device, test_loader):
             
             out, _, _ = model(Drug, SE, DrugMask, SEMsak)
             
-            # 预测所有，不过滤
             location = torch.where(Label >= 0) 
             pred = out[location]
             label = Label[location]
@@ -178,95 +227,89 @@ def predict(model, device, test_loader):
             total_labels = torch.cat((total_labels, label.cpu()), 0)
     return total_labels.numpy().flatten(), total_preds.numpy().flatten()
 
-# --- 3. 主流程 ---
+# --- 4. 主逻辑 ---
 
 def run_cold_start():
-    # 参数设置
-    EPOCHS = 5 # 建议跑 20 轮，反正现在速度快
+    EPOCHS = 50
     BATCH_SIZE = 128
     LR = 0.0001
     DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"Running Cold Start Experiment on {DEVICE}")
 
-    # 1. 加载 759 数据
-    print("Loading 759 Data...")
-    df_smiles = pd.read_csv(SMILES_FILE_759, header=None) 
+    # 1. 加载数据
+    print("Loading 750 Data...")
+    df_smiles = pd.read_csv(SMILES_FILE, header=None) 
     all_smiles = df_smiles.iloc[:, 1].tolist()
+    mat_data = sio.loadmat(FREQ_FILE)
+    freq_matrix = mat_data['R']
     
-    mat_data = sio.loadmat(FREQ_FILE_759)
-    # 自动找 key
-    matrix_key = [k for k in mat_data.keys() if not k.startswith('__')][0]
-    freq_matrix = mat_data[matrix_key]
+    # 2. 手动切分 (90% Train, 10% Test)
+    indices = list(range(len(all_smiles)))
+    random.seed(42) 
+    random.shuffle(indices)
     
-    # 2. 切分数据 (前9个Test，后750个Train)
-    test_smiles = all_smiles[:9]
-    test_matrix = freq_matrix[:9, :]
+    split_point = int(len(all_smiles) * 0.9)
+    train_indices = indices[:split_point]
+    test_indices = indices[split_point:]
     
-    train_smiles = all_smiles[9:]
-    train_matrix = freq_matrix[9:, :]
+    test_smiles = [all_smiles[i] for i in test_indices]
+    test_matrix = freq_matrix[test_indices, :]
     
-    print(f"Train Drugs: {len(train_smiles)}, Test Drugs: {len(test_smiles)}")
+    print(f"Split: Train Drugs={len(train_indices)}, Test Drugs={len(test_indices)}")
 
-    # 3. 构造训练集 list (用于 identify_sub)
-    train_data_list = []
-    for i in range(len(train_smiles)):
-        for j in range(994):
-            train_data_list.append([j, train_smiles[i], train_matrix[i, j]])
+    # 3. 准备数据 DataFrame
+    # 训练集：使用平衡采样 (1:1) -> 速度快，逻辑对齐 main.py
+    df_train = get_balanced_train_data(train_indices, freq_matrix, all_smiles)
     
-    # 4. 关键步骤：只用训练集运行 Identify Sub (生成 _cold_start.npy 文件)
-    identify_sub_optimized(train_data_list, suffix='cold_start')
-
-    # 5. 准备 Dataset 所需的 DataFrame
-    print("Preparing DataFrames...")
-    df_train = pd.DataFrame(train_data_list, columns=['SE_id', 'Drug_smile', 'Label'])
-    
-    # 为了加速训练，可以只训练 Label!=0 的数据 (作者原逻辑是做了采样的)
-    # 但为了简单且不出错，全量训练也没问题，反正现在有内存加速
-    # 如果想更快，可以加上：df_train = df_train[df_train['Label'] > 0]
-    
+    # 测试集：全量测试 (不采样) -> 严谨评估
+    print("Preparing Test Data (Full)...")
     test_data_list = []
     for i in range(len(test_smiles)):
         for j in range(994):
             test_data_list.append([j, test_smiles[i], test_matrix[i, j]])
     df_test = pd.DataFrame(test_data_list, columns=['SE_id', 'Drug_smile', 'Label'])
 
-    # 6. DataLoader
-    train_dataset = Data_Encoder(df_train, suffix='cold_start')
-    test_dataset = Data_Encoder(df_test, suffix='cold_start')
+    # 4. Identify Sub (只用训练集的 DataFrame)
+    # 注意：这里传给 identify_sub 的是已经采样过的 balanced df，但这也没问题，
+    # 或者为了更精准，可以用全量正样本算 sub。
+    # 为了简化且不报错，我们直接用 df_train，因为它包含了所有正样本。
+    identify_sub_optimized(df_train, suffix='cold_start_750')
+
+    # 5. DataLoader
+    train_dataset = Data_Encoder(df_train, suffix='cold_start_750')
+    test_dataset = Data_Encoder(df_test, suffix='cold_start_750')
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # 7. 模型初始化
+    # 6. 模型
     model = Trans().to(DEVICE)
-    model.device = DEVICE # 修复硬编码
+    model.device = DEVICE 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=0.01)
 
-    # 8. 训练循环
+    # 7. 训练
     for epoch in range(EPOCHS):
         loss = trainfun(model, DEVICE, train_loader, optimizer, epoch+1)
         print(f"Epoch {epoch+1} Loss: {loss:.4f}")
 
-    # 9. 预测与评估
-    print("Predicting Cold Start Drugs...")
+    # 8. 预测
+    print("Predicting on Cold Start Test Set...")
     true_labels, pred_scores = predict(model, DEVICE, test_loader)
     
-    # 指标计算
     try:
         p_val = pearson(true_labels, pred_scores)
+        sp_val = spearman(true_labels, pred_scores)
         rmse_val = rmse(true_labels, pred_scores)
         mae_val = MAE(true_labels, pred_scores)
-        sp_val = spearman(true_labels, pred_scores)
     except:
-        p_val, rmse_val, mae_val, sp_val = 0,0,0,0
+        p_val, sp_val, rmse_val, mae_val = 0,0,0,0
 
-    print("\n=== Cold Start Experiment Results (9 New Drugs) ===")
+    print("\n=== Cold Start Experiment Results (75 New Drugs) ===")
     print(f"Pearson:  {p_val:.5f}")
     print(f"Spearman: {sp_val:.5f}")
     print(f"RMSE:     {rmse_val:.5f}")
     print(f"MAE:      {mae_val:.5f}")
     
-    # 保存结果
     if not os.path.exists('predictResult'): os.makedirs('predictResult')
     np.save('predictResult/cold_start_preds.npy', pred_scores)
     np.save('predictResult/cold_start_labels.npy', true_labels)
